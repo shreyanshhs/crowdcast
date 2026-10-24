@@ -27,9 +27,9 @@ from uagents_core.contrib.protocols.chat import (
 )
 
 # ---- Paste the addresses of your other 3 hosted agents here ---------------
-CROWD_ADDRESS = "agent1q_REPLACE_WITH_CROWD_AGENT_ADDRESS"
-SIM_ADDRESS = "agent1q_REPLACE_WITH_SIMULATION_AGENT_ADDRESS"
-REWRITE_ADDRESS = "agent1q_REPLACE_WITH_REWRITE_AGENT_ADDRESS"
+CROWD_ADDRESS = "agent1qddxa9d59mzv6ggdmff8d0kd2c5hssdv2w3ufx5kd0uaaxec6tvrzj8u6xh"
+SIM_ADDRESS = "agent1qv4tvuw3sklnf2wuufq7dq6pnkqt8mq9kq03kyyjl0w9p9n44d4xvr6p0h2"
+REWRITE_ADDRESS = "agent1qtumj924vkyrkzw6smrlkrg5ss0tqeevv34l4ehuhg88uttnxa7aq3wwrdl"
 
 DEFAULT_SIZE = 10_000
 MAX_SIZE = 100_000

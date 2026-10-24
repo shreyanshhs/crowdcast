@@ -42,10 +42,10 @@ Report + interactive card back to the user
 ## Agents (all hosted on Agentverse)
 | Agent | Address | Agentverse profile |
 |---|---|---|
-| crowdcast-orchestrator | `agent1q...` | link |
-| crowdcast-crowd | `agent1q...` | link |
-| crowdcast-simulation | `agent1q...` | link |
-| crowdcast-rewrite | `agent1q...` | link |
+| crowdcast-orchestrator | `agent1q26xmt9hz654pcx0h5uhqr5ccg5syvd6d3gqsrhynmzetm72j0wlgdrdsj9` | [profile](https://agentverse.ai/agents/details/agent1q26xmt9hz654pcx0h5uhqr5ccg5syvd6d3gqsrhynmzetm72j0wlgdrdsj9/profile) |
+| crowdcast-crowd | `agent1qddxa9d59mzv6ggdmff8d0kd2c5hssdv2w3ufx5kd0uaaxec6tvrzj8u6xh` | [profile](https://agentverse.ai/agents/details/agent1qddxa9d59mzv6ggdmff8d0kd2c5hssdv2w3ufx5kd0uaaxec6tvrzj8u6xh/profile) |
+| crowdcast-simulation | `agent1qv4tvuw3sklnf2wuufq7dq6pnkqt8mq9kq03kyyjl0w9p9n44d4xvr6p0h2` | [profile](https://agentverse.ai/agents/details/agent1qv4tvuw3sklnf2wuufq7dq6pnkqt8mq9kq03kyyjl0w9p9n44d4xvr6p0h2/profile) |
+| crowdcast-rewrite | `agent1qtumj924vkyrkzw6smrlkrg5ss0tqeevv34l4ehuhg88uttnxa7aq3wwrdl` | [profile](https://agentverse.ai/agents/details/agent1qtumj924vkyrkzw6smrlkrg5ss0tqeevv34l4ehuhg88uttnxa7aq3wwrdl/profile) |
 
 ## Try it
 1. Open [ASI:One](https://asi1.ai/chat) and mention the orchestrator agent.
