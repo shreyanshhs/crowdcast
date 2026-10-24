@@ -3,8 +3,9 @@ Crowdcast — ORCHESTRATOR agent (hosted on Agentverse).
 
 This is the only agent users talk to in ASI:One. It:
   1. receives the content (pitch / post / ad) through the Agent Chat Protocol
-  2. sends it to the Crowd agent      -> real persona reactions (ASI:One LLM)
-  3. sends reactions to Simulation     -> weighted expansion to N impressions
+  2. fans it out to 5 regional Crowd agents in parallel
+                                       -> real persona reactions (ASI:One LLM)
+  3. merges them and sends to Simulation -> weighted expansion to N impressions
   4. sends objections to Rewrite agent -> improved version (ASI:One LLM)
   5. replies to the user with a text report + an ASI:One interactive card
 
@@ -13,7 +14,9 @@ message model classes must be IDENTICAL in every agent file.
 """
 
 import json
+import random
 import re
+import time
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -26,13 +29,20 @@ from uagents_core.contrib.protocols.chat import (
     chat_protocol_spec,
 )
 
-# ---- Paste the addresses of your other 3 hosted agents here ---------------
-CROWD_ADDRESS = "agent1qddxa9d59mzv6ggdmff8d0kd2c5hssdv2w3ufx5kd0uaaxec6tvrzj8u6xh"
+# ---- Addresses of the other hosted agents ----------------------------------
+CROWD_ADDRESSES = [
+    "agent1qw6elpnrg0wqsw59unxnw5ymynypt9wh0g8n47jf5v7250vxwsn872e5saf",  # north
+    "agent1qddxa9d59mzv6ggdmff8d0kd2c5hssdv2w3ufx5kd0uaaxec6tvrzj8u6xh",  # south
+    "agent1q0yyadpxdy50xrfa35r6jltp5mla7pspfa6aqu83e4pwvrtlmepqgpv09dy",  # west
+    "agent1q2vtvps6krssghyx7vctv3np6py4022jn5njs4pcdl6hpykjs6y3g97zdng",  # east
+    "agent1qf98p6vzlwdd3ze43x4q2e3ghptcxyje53khlp60qe64c8a3rfdnwq9yj9d",  # central
+]
 SIM_ADDRESS = "agent1qv4tvuw3sklnf2wuufq7dq6pnkqt8mq9kq03kyyjl0w9p9n44d4xvr6p0h2"
 REWRITE_ADDRESS = "agent1qtumj924vkyrkzw6smrlkrg5ss0tqeevv34l4ehuhg88uttnxa7aq3wwrdl"
 
 DEFAULT_SIZE = 10_000
 MAX_SIZE = 100_000
+CROWD_TIMEOUT_S = 75  # go ahead with whichever crowd agents answered by then
 USE_CARDS = True  # set False if the card ever causes trouble
 
 
@@ -102,10 +112,17 @@ def clean_content(text: str) -> str:
     m = re.match(r"^([^:\n]{0,140}):\s*", t)
     if m and re.search(r"\b(react|reaction|think|feel|test|respond|rate|review|audience|crowd|people)\b", m.group(1), re.I):
         t = t[m.end():]
-    t = re.sub(r"[\s,.(]*\b(?:crowd|audience|impressions?|people)\s*(?:size\s*)?:?\s*\d+\s*k\b\)?\s*$", "", t, flags=re.I)
-    t = re.sub(r"[\s,.(]*\b\d+\s*k\s*(?:crowd|audience|impressions?|people)\b\)?\s*$", "", t, flags=re.I)
+    t = re.sub(r"[\s,(]*\b(?:crowd|audience|impressions?|people)\s*(?:size\s*)?:?\s*\d+\s*k\b\)?\s*$", "", t, flags=re.I)
+    t = re.sub(r"[\s,(]*\b\d+\s*k\s*(?:crowd|audience|impressions?|people)\b\)?\s*$", "", t, flags=re.I)
     t = t.strip().strip('"“”').strip()
     return t or text
+
+
+def merge_reactions(batches: list, seed: str) -> list:
+    """Flatten the regional panels and shuffle, so quotes and objections aren't all from one region."""
+    merged = [r for batch in batches for r in batch]
+    random.Random(seed).shuffle(merged)
+    return merged
 
 
 def build_report(stats: dict, rewrite: str) -> str:
@@ -133,9 +150,9 @@ def build_report(stats: dict, rewrite: str) -> str:
         "✍️ Rewritten version that should test better:",
         rewrite,
         "",
-        f"Method: {stats['personas']} AI persona agents each reacted to your content; "
-        f"their reactions were weighted by audience segment and statistically "
-        f"expanded to {stats['size']:,} impressions.",
+        f"Method: {stats['personas']} AI personas from {stats.get('crowd_agents', 1)} regional "
+        f"crowd agents each reacted to your content; their reactions were weighted by "
+        f"audience segment and statistically expanded to {stats['size']:,} impressions.",
     ]
     return "\n".join(lines)
 
@@ -194,7 +211,8 @@ def build_card(stats: dict, rewrite: str) -> dict:
         "root": {
             "type": "section",
             "title": "Crowdcast results",
-            "subtitle": f"{stats['size']:,} simulated impressions from {stats['personas']} persona agents",
+            "subtitle": f"{stats['size']:,} simulated impressions from {stats['personas']} personas "
+            f"across {stats.get('crowd_agents', 1)} crowd agents",
             "children": children,
         }
     }
@@ -241,9 +259,15 @@ async def handle_chat(ctx: Context, sender: str, msg: ChatMessage):
 
     session = uuid4().hex
     content = clean_content(text)
-    ctx.storage.set(session, {"user": sender, "content": content, "size": parse_size(text)})
-    ctx.logger.info(f"[{session}] new test from {sender}")
-    await ctx.send(CROWD_ADDRESS, CrowdRequest(session=session, content=content))
+    ctx.storage.set(session, {
+        "user": sender, "content": content, "size": parse_size(text),
+        "started": time.time(), "pending": list(CROWD_ADDRESSES), "reactions": [],
+        "dispatched": False,
+    })
+    ctx.storage.set("active", (ctx.storage.get("active") or []) + [session])
+    ctx.logger.info(f"[{session}] new test from {sender}, asking {len(CROWD_ADDRESSES)} crowd agents")
+    for address in CROWD_ADDRESSES:
+        await ctx.send(address, CrowdRequest(session=session, content=content))
 
 
 @chat_proto.on_message(ChatAcknowledgement)
@@ -251,17 +275,62 @@ async def handle_ack(ctx: Context, sender: str, msg: ChatAcknowledgement):
     pass
 
 
-# ---- Pipeline: crowd -> simulation -> rewrite -> user ----------------------
+# ---- Pipeline: crowds (parallel) -> simulation -> rewrite -> user ----------
+async def send_to_simulation(ctx: Context, session: str, s: dict):
+    s["dispatched"] = True
+    s["crowds"] = len(s["reactions"])
+    reactions = merge_reactions(s["reactions"], session)
+    s["reactions"] = []
+    ctx.storage.set(session, s)
+    await ctx.send(
+        SIM_ADDRESS,
+        SimRequest(session=session, reactions_json=json.dumps(reactions), size=s["size"]),
+    )
+
+
 @agent.on_message(model=CrowdResult)
 async def on_crowd(ctx: Context, sender: str, msg: CrowdResult):
     s = ctx.storage.get(msg.session)
-    if not s:
+    if not s or s.get("dispatched") or sender not in s["pending"]:
         return
-    ctx.logger.info(f"[{msg.session}] crowd reacted")
-    await ctx.send(
-        SIM_ADDRESS,
-        SimRequest(session=msg.session, reactions_json=msg.reactions_json, size=s["size"]),
+    s["pending"].remove(sender)
+    s["reactions"].append(json.loads(msg.reactions_json))
+    ctx.storage.set(msg.session, s)
+    ctx.logger.info(
+        f"[{msg.session}] crowd {len(s['reactions'])}/{len(CROWD_ADDRESSES)} reacted"
     )
+    if not s["pending"]:
+        await send_to_simulation(ctx, msg.session, s)
+
+
+@agent.on_interval(period=5.0)
+async def check_timeouts(ctx: Context):
+    """Don't let one slow or stopped crowd agent hold up the report."""
+    due, keep = [], []
+    for session in ctx.storage.get("active") or []:
+        s = ctx.storage.get(session)
+        if not s or s.get("dispatched"):
+            continue
+        if time.time() - s["started"] > CROWD_TIMEOUT_S:
+            due.append((session, s))
+        else:
+            keep.append(session)
+    ctx.storage.set("active", keep)
+    for session, s in due:
+        if s["reactions"]:
+            ctx.logger.warning(
+                f"[{session}] timed out waiting for {len(s['pending'])} crowd agent(s); "
+                f"going ahead with {len(s['reactions'])}"
+            )
+            await send_to_simulation(ctx, session, s)
+        else:
+            s["dispatched"] = True
+            ctx.storage.set(session, s)
+            ctx.logger.warning(f"[{session}] no crowd agent answered")
+            await ctx.send(
+                s["user"],
+                text_message("Sorry, the crowd didn't respond in time. Please try again in a minute."),
+            )
 
 
 @agent.on_message(model=SimResult)
@@ -269,9 +338,10 @@ async def on_sim(ctx: Context, sender: str, msg: SimResult):
     s = ctx.storage.get(msg.session)
     if not s:
         return
-    s["stats"] = msg.stats_json
-    ctx.storage.set(msg.session, s)
     stats = json.loads(msg.stats_json)
+    stats["crowd_agents"] = s.get("crowds", 1)
+    s["stats"] = json.dumps(stats)
+    ctx.storage.set(msg.session, s)
     ctx.logger.info(f"[{msg.session}] simulation done")
     await ctx.send(
         REWRITE_ADDRESS,
