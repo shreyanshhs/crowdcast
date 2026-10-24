@@ -89,6 +89,12 @@ HELP_RE = re.compile(
     r"|(created|made|built) to do|tell me (about yourself|what you)|how (does|do) (this|you|it|crowdcast) work"
     r"|what is crowdcast|^(?:help|start|hello|hey|hi)\W*$)", re.I)
 # our own replies coming back at us (e.g. relayed by a planner) must never become a new test
+# ASI:One's own assistant answers our messages ("Got it — I'll keep an eye out ..."); that chatter
+# reaches us as a chat message and must not be tested as a pitch
+CHATTER_RE = re.compile(
+    r"^(?:(?:got it|thanks|thank you|sounds good|noted|will do|understood|let me know"
+    r"|here (?:are|is) the results|the results)\b|i'?ll |i will "
+    r"|(?:great|ok(?:ay)?|perfect|awesome|sure|cool|nice)\s*[!.,—–-])", re.I)
 ECHO_MARKERS = ("🧪 Testing", "📣 ", "🔬 Original vs rewrite", "🗺️ Regional panels", "ℹ️ ", "⏳ ",
                 "Charts, objections and a rewrite are in the card", "Crowdcast results —", "Hi, I'm Crowdcast")
 
@@ -676,6 +682,9 @@ async def handle_chat(ctx: Context, sender: str, msg: ChatMessage):
 
     if any(marker in text for marker in ECHO_MARKERS):
         ctx.logger.warning("ignored: looks like one of our own replies")
+        return
+    if CHATTER_RE.search(strip_mentions(text)):
+        ctx.logger.warning("ignored: conversational reply, not content to test")
         return
 
     action = parse_action(text, ctx.storage.get(f"latest:{sender}"))
