@@ -96,6 +96,18 @@ def parse_size(text: str) -> int:
     return DEFAULT_SIZE
 
 
+def clean_content(text: str) -> str:
+    """Strip @mentions, a leading ask like 'How will people react to this pitch:' and size hints."""
+    t = re.sub(r"^(?:\s*@[\w.-]+)+\s*", "", text)
+    m = re.match(r"^([^:\n]{0,140}):\s*", t)
+    if m and re.search(r"\b(react|reaction|think|feel|test|respond|rate|review|audience|crowd|people)\b", m.group(1), re.I):
+        t = t[m.end():]
+    t = re.sub(r"[\s,.(]*\b(?:crowd|audience|impressions?|people)\s*(?:size\s*)?:?\s*\d+\s*k\b\)?\s*$", "", t, flags=re.I)
+    t = re.sub(r"[\s,.(]*\b\d+\s*k\s*(?:crowd|audience|impressions?|people)\b\)?\s*$", "", t, flags=re.I)
+    t = t.strip().strip('"“”').strip()
+    return t or text
+
+
 def build_report(stats: dict, rewrite: str) -> str:
     lines = [
         f"📣 Crowdcast results — {stats['size']:,} simulated impressions",
@@ -228,9 +240,10 @@ async def handle_chat(ctx: Context, sender: str, msg: ChatMessage):
         return
 
     session = uuid4().hex
-    ctx.storage.set(session, {"user": sender, "content": text, "size": parse_size(text)})
+    content = clean_content(text)
+    ctx.storage.set(session, {"user": sender, "content": content, "size": parse_size(text)})
     ctx.logger.info(f"[{session}] new test from {sender}")
-    await ctx.send(CROWD_ADDRESS, CrowdRequest(session=session, content=text))
+    await ctx.send(CROWD_ADDRESS, CrowdRequest(session=session, content=content))
 
 
 @chat_proto.on_message(ChatAcknowledgement)
