@@ -69,9 +69,10 @@ SIZES = [10_000, 50_000, 100_000]
 ACTIONS = ("run", "setup", "retest", "regions")
 REWRITE_FAILED = "(Rewrite unavailable"
 
-# chart colours: diverging pair (love = blue, hate = red) around a neutral gray
-LOVE, IGNORE, HATE = "#2a78d6", "#a3a29b", "#e34948"
-CHART_BG, INK, INK_MUTED, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#e8e7e3"
+# chart colours (dark mode): diverging pair (love = blue, hate = red) around a
+# neutral gray, on a dark surface; segments also carry direct labels + gaps
+LOVE, IGNORE, HATE = "#3987e5", "#6e6d68", "#e66767"
+CHART_BG, INK, INK_MUTED, GRID = "#1a1a19", "#f0efec", "#c3c2b7", "#2c2c2a"
 QUICKCHART_URL = "https://quickchart.io/chart"
 
 
@@ -248,7 +249,7 @@ def chart_url(title: str, rows: list, axis_label: str) -> str:
             "labels": [r[0] for r in rows],
             "datasets": [
                 dataset("Love", 1, LOVE, "#ffffff"),
-                dataset("Ignore", 2, IGNORE, INK),
+                dataset("Ignore", 2, IGNORE, "#ffffff"),
                 dataset("Hate", 3, HATE, "#ffffff"),
             ],
         },
