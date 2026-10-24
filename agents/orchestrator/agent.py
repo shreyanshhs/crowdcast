@@ -2,12 +2,20 @@
 Crowdcast — ORCHESTRATOR agent (hosted on Agentverse).
 
 This is the only agent users talk to in ASI:One. It:
-  1. receives the content (pitch / post / ad) through the Agent Chat Protocol
+  1. receives the content (pitch / post / ad) through the Agent Chat Protocol,
+     either pasted directly or through a setup card (platform, region, size)
   2. fans it out to 5 regional Crowd agents in parallel
                                        -> real persona reactions (ASI:One LLM)
   3. merges them and sends to Simulation -> weighted expansion to N impressions
   4. sends objections to Rewrite agent -> improved version (ASI:One LLM)
-  5. replies to the user with a text report + an ASI:One interactive card
+  5. replies with a text report + an ASI:One interactive card with charts
+  6. on "Test the rewrite", runs the rewrite through the same crowd on its own
+     and replies with a before/after card
+
+Card clicks come back as a ChatMessage whose text is the button's selection
+(JSON when the user @mentions us, prose when ASI:One's planner routed them).
+Charts are PNGs rendered by QuickChart from the real numbers; every chart has
+a text fallback in the card and in the plain-text report.
 
 Hosted-agent rules: no global state (use ctx.storage), no custom seed,
 message model classes must be IDENTICAL in every agent file.
@@ -18,6 +26,7 @@ import random
 import re
 import time
 from datetime import datetime, timezone
+from urllib.parse import urlencode
 from uuid import uuid4
 
 from uagents import Agent, Context, Model, Protocol
@@ -30,20 +39,40 @@ from uagents_core.contrib.protocols.chat import (
 )
 
 # ---- Addresses of the other hosted agents ----------------------------------
-CROWD_ADDRESSES = [
-    "agent1qw6elpnrg0wqsw59unxnw5ymynypt9wh0g8n47jf5v7250vxwsn872e5saf",  # north
-    "agent1qddxa9d59mzv6ggdmff8d0kd2c5hssdv2w3ufx5kd0uaaxec6tvrzj8u6xh",  # south
-    "agent1q0yyadpxdy50xrfa35r6jltp5mla7pspfa6aqu83e4pwvrtlmepqgpv09dy",  # west
-    "agent1q2vtvps6krssghyx7vctv3np6py4022jn5njs4pcdl6hpykjs6y3g97zdng",  # east
-    "agent1qf98p6vzlwdd3ze43x4q2e3ghptcxyje53khlp60qe64c8a3rfdnwq9yj9d",  # central
-]
+CROWD_AGENTS = {
+    "north": "agent1qw6elpnrg0wqsw59unxnw5ymynypt9wh0g8n47jf5v7250vxwsn872e5saf",
+    "south": "agent1qddxa9d59mzv6ggdmff8d0kd2c5hssdv2w3ufx5kd0uaaxec6tvrzj8u6xh",
+    "west": "agent1q0yyadpxdy50xrfa35r6jltp5mla7pspfa6aqu83e4pwvrtlmepqgpv09dy",
+    "east": "agent1q2vtvps6krssghyx7vctv3np6py4022jn5njs4pcdl6hpykjs6y3g97zdng",
+    "central": "agent1qf98p6vzlwdd3ze43x4q2e3ghptcxyje53khlp60qe64c8a3rfdnwq9yj9d",
+}
+CROWD_ADDRESSES = list(CROWD_AGENTS.values())
 SIM_ADDRESS = "agent1qv4tvuw3sklnf2wuufq7dq6pnkqt8mq9kq03kyyjl0w9p9n44d4xvr6p0h2"
 REWRITE_ADDRESS = "agent1qtumj924vkyrkzw6smrlkrg5ss0tqeevv34l4ehuhg88uttnxa7aq3wwrdl"
 
 DEFAULT_SIZE = 10_000
 MAX_SIZE = 100_000
 CROWD_TIMEOUT_S = 75  # go ahead with whichever crowd agents answered by then
-USE_CARDS = True  # set False if the card ever causes trouble
+NOISE_PTS = 5         # identical runs differ by ~4 points; smaller gaps are "no clear difference"
+USE_CARDS = True      # set False if the card ever causes trouble
+SEND_PROGRESS = True  # short "testing..." message while the crowd reacts
+
+REGION_LABELS = {
+    "all": "All India", "north": "North India", "south": "South India",
+    "west": "West India", "east": "East India", "central": "Central India",
+}
+PLATFORMS = {
+    "unspecified": "Not specified", "pitch": "Startup pitch", "instagram": "Instagram post",
+    "linkedin": "LinkedIn post", "x": "X (Twitter) post", "youtube": "YouTube video", "ad": "Ad",
+}
+SIZES = [10_000, 50_000, 100_000]
+ACTIONS = ("run", "setup", "retest", "regions")
+REWRITE_FAILED = "(Rewrite unavailable"
+
+# chart colours: diverging pair (love = blue, hate = red) around a neutral gray
+LOVE, IGNORE, HATE = "#2a78d6", "#a3a29b", "#e34948"
+CHART_BG, INK, INK_MUTED, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#e8e7e3"
+QUICKCHART_URL = "https://quickchart.io/chart"
 
 
 # ---- Shared message models (keep identical in every agent) -----------------
@@ -96,6 +125,23 @@ def text_message(text: str) -> ChatMessage:
     )
 
 
+def card_message(text: str, card: dict, terminal: bool) -> ChatMessage:
+    """Plain-text fallback first, then the card for ASI:One to render."""
+    content = [TextContent(type="text", text=text)]
+    if USE_CARDS:
+        metadata = {
+            "card_protocol_version": "1",
+            "requires_card_interaction": "true",
+            "card_kind": "custom",
+            "card_payload": json.dumps(card),
+            "preferred_drawer_width_px": "640",
+        }
+        if terminal:
+            metadata["is_terminal"] = "true"
+        content.append(MetadataContent(type="metadata", metadata=metadata))
+    return ChatMessage(timestamp=now(), msg_id=uuid4(), content=content)
+
+
 def parse_size(text: str) -> int:
     """Pick up a crowd size like 'crowd 100k' or 'audience 50k'. Default 10k."""
     m = re.search(r"(?:crowd|audience|impressions?|people)\D{0,12}(\d+)\s*k\b", text.lower())
@@ -106,9 +152,13 @@ def parse_size(text: str) -> int:
     return DEFAULT_SIZE
 
 
+def strip_mentions(text: str) -> str:
+    return re.sub(r"^(?:\s*@[\w.-]+)+\s*", "", text)
+
+
 def clean_content(text: str) -> str:
     """Strip @mentions, a leading ask like 'How will people react to this pitch:' and size hints."""
-    t = re.sub(r"^(?:\s*@[\w.-]+)+\s*", "", text)
+    t = strip_mentions(text)
     m = re.match(r"^([^:\n]{0,140}):\s*", t)
     if m and re.search(r"\b(react|reaction|think|feel|test|respond|rate|review|audience|crowd|people)\b", m.group(1), re.I):
         t = t[m.end():]
@@ -118,6 +168,17 @@ def clean_content(text: str) -> str:
     return t or text
 
 
+def for_crowd(content: str, platform: str) -> str:
+    """Tell the personas (and the rewriter) what kind of content they're looking at."""
+    if platform in PLATFORMS and platform != "unspecified":
+        return f"Format: {PLATFORMS[platform]}\n\n{content}"
+    return content
+
+
+def strip_format_line(text: str) -> str:
+    return re.sub(r"^\s*Format:[^\n]*\n+", "", text).strip()
+
+
 def merge_reactions(batches: list, seed: str) -> list:
     """Flatten the regional panels and shuffle, so quotes and objections aren't all from one region."""
     merged = [r for batch in batches for r in batch]
@@ -125,20 +186,129 @@ def merge_reactions(batches: list, seed: str) -> list:
     return merged
 
 
-def build_report(stats: dict, rewrite: str) -> str:
+def split_pct(counts: dict, n: int) -> tuple:
+    """Whole-number love/ignore/hate percentages that add up to 100."""
+    if not n:
+        return 0, 0, 0
+    love = round(100 * counts.get("love", 0) / n)
+    hate = round(100 * counts.get("hate", 0) / n)
+    return love, 100 - love - hate, hate
+
+
+def summarise_regions(batches: list) -> list:
+    """Raw panel results per regional crowd agent (no smoothing, no projection)."""
+    out = []
+    for region in CROWD_AGENTS:
+        reactions = [r for b in batches if b["region"] == region for r in b["reactions"]]
+        if not reactions:
+            continue
+        counts = {}
+        for r in reactions:
+            counts[r["reaction"]] = counts.get(r["reaction"], 0) + 1
+        love, ignore, hate = split_pct(counts, len(reactions))
+        answered = [r for r in reactions if r.get("reason") and r["reason"] != "(no response)"]
+        out.append({
+            "region": region, "label": REGION_LABELS[region], "n": len(reactions),
+            "love_pct": love, "ignore_pct": ignore, "hate_pct": hate,
+            "quotes": [f"{r['reason']} — {r['name']}, {r['age']}, {r['city']}" for r in answered[:2]],
+            "objections": [r["objection"] for r in reactions if r.get("objection")][:2],
+            "failed": len(answered) == 0,
+        })
+    return out
+
+
+def rewrite_ok(rewrite: str) -> bool:
+    return bool(rewrite) and not rewrite.startswith(REWRITE_FAILED)
+
+
+def verdict(before: dict, after: dict) -> str:
+    d_love = after["love_pct"] - before["love_pct"]
+    d_hate = after["hate_pct"] - before["hate_pct"]
+    if d_love >= NOISE_PTS and d_hate <= 0:
+        return f"The rewrite tested better: +{d_love} pts love, {d_hate:+d} pts hate."
+    if d_love <= -NOISE_PTS or d_hate >= NOISE_PTS:
+        return f"The original tested better: rewrite is {d_love:+d} pts love, {d_hate:+d} pts hate."
+    return (f"No clear difference ({d_love:+d} pts love, {d_hate:+d} pts hate). "
+            f"Gaps under {NOISE_PTS} points are within normal run-to-run variation.")
+
+
+# ---- Charts (QuickChart PNGs from real numbers) ----------------------------
+def chart_url(title: str, rows: list, axis_label: str) -> str:
+    """100% stacked horizontal bars, one row per (label, love, ignore, hate)."""
+    def dataset(name, idx, colour, label_colour):
+        return {  # zero -> null, so empty segments get no stray "0" label
+            "label": name, "data": [r[idx] or None for r in rows], "backgroundColor": colour,
+            "borderColor": CHART_BG, "borderWidth": 2, "barThickness": 20,
+            "datalabels": {"color": label_colour},
+        }
+
+    config = {
+        "type": "horizontalBar",
+        "data": {
+            "labels": [r[0] for r in rows],
+            "datasets": [
+                dataset("Love", 1, LOVE, "#ffffff"),
+                dataset("Ignore", 2, IGNORE, INK),
+                dataset("Hate", 3, HATE, "#ffffff"),
+            ],
+        },
+        "options": {
+            "title": {"display": True, "text": title, "fontColor": INK, "fontSize": 14},
+            "legend": {"position": "bottom", "labels": {"fontColor": INK_MUTED, "boxWidth": 12}},
+            "scales": {
+                "xAxes": [{
+                    "stacked": True, "ticks": {"min": 0, "max": 100, "fontColor": INK_MUTED},
+                    "gridLines": {"color": GRID},
+                    "scaleLabel": {"display": True, "labelString": axis_label, "fontColor": INK_MUTED},
+                }],
+                "yAxes": [{"stacked": True, "ticks": {"fontColor": INK_MUTED}, "gridLines": {"display": False}}],
+            },
+            "plugins": {"datalabels": {"display": "auto", "font": {"size": 11}}},
+        },
+    }
+    height = 130 + 40 * len(rows)
+    query = {"w": 600, "h": height, "bkg": CHART_BG, "f": "png",
+             "c": json.dumps(config, separators=(",", ":"))}
+    return f"{QUICKCHART_URL}?{urlencode(query)}"
+
+
+def segment_chart(stats: dict) -> str:
+    rows = [(s["label"], s["love_pct"], s["ignore_pct"], s["hate_pct"]) for s in stats["segments"]]
+    return chart_url("Projected reaction by audience segment", rows, "% of each segment")
+
+
+def region_chart(regions: list) -> str:
+    rows = [(f"{r['label']} ({r['n']})", r["love_pct"], r["ignore_pct"], r["hate_pct"]) for r in regions]
+    return chart_url("Raw persona panels by region (personas per panel)", rows, "% of panel")
+
+
+def compare_chart(before: dict, after: dict) -> str:
+    rows = [("Original", before["love_pct"], before["ignore_pct"], before["hate_pct"]),
+            ("Rewrite", after["love_pct"], after["ignore_pct"], after["hate_pct"])]
+    return chart_url("Original vs rewrite (projected)", rows, "% of impressions")
+
+
+def pct_line(x: dict) -> str:
+    return f"{x['love_pct']}% love · {x['ignore_pct']}% ignore · {x['hate_pct']}% hate"
+
+
+# ---- Plain-text reports (fallback when cards don't render) -----------------
+def build_report(s: dict, stats: dict, rewrite: str) -> str:
     lines = [
         f"📣 Crowdcast results — {stats['size']:,} simulated impressions",
+        f"Platform: {PLATFORMS.get(s.get('platform'), PLATFORMS['unspecified'])} · "
+        f"Target: {REGION_LABELS.get(s.get('region'), REGION_LABELS['all'])}",
         "",
         f"❤️ Love {stats['love_pct']}%  ·  😐 Ignore {stats['ignore_pct']}%  ·  👎 Hate {stats['hate_pct']}%",
         f"🔁 {stats['shares']:,} shares → projected total reach {stats['total_reach']:,}",
         "",
         "Segments (best first):",
     ]
-    for s in stats["segments"]:
-        lines.append(
-            f"• {s['label']}: {s['love_pct']}% love, {s['ignore_pct']}% ignore, "
-            f"{s['hate_pct']}% hate ({s['seen']:,} saw it)"
-        )
+    for seg in stats["segments"]:
+        lines.append(f"• {seg['label']}: {pct_line(seg)} ({seg['seen']:,} saw it)")
+    if s.get("regions"):
+        lines += ["", "Regional persona panels (raw, not projected):"]
+        lines += [f"• {r['label']} ({r['n']} personas): {pct_line(r)}" for r in s["regions"]]
     if stats.get("objections"):
         lines += ["", "Top objections:"]
         lines += [f"{i}. {o}" for i, o in enumerate(stats["objections"], 1)]
@@ -154,87 +324,261 @@ def build_report(stats: dict, rewrite: str) -> str:
         f"crowd agents each reacted to your content; their reactions were weighted by "
         f"audience segment and statistically expanded to {stats['size']:,} impressions.",
     ]
+    if rewrite_ok(rewrite):
+        lines += ["", "Reply with this session to retest the rewrite: "
+                      + json.dumps({"action": "retest", "session": s["id"]})]
     return "\n".join(lines)
 
 
-def build_card(stats: dict, rewrite: str) -> dict:
-    """ASI:One custom interactive card (informational, no input needed)."""
-    seg_items = [
-        {
-            "children": [
-                {"type": "text", "value": s["label"], "style": "emphasis"},
-                {
-                    "type": "text",
-                    "value": f"{s['love_pct']}% love · {s['ignore_pct']}% ignore · "
-                    f"{s['hate_pct']}% hate · {s['seen']:,} saw it",
-                    "style": "muted",
-                },
-            ]
-        }
-        for s in stats["segments"]
+def build_compare_report(before: dict, after: dict, original: str, rewrite: str) -> str:
+    return "\n".join([
+        "🔬 Original vs rewrite — each tested separately on the same crowd",
+        f"Original: {pct_line(before)}",
+        f"Rewrite:  {pct_line(after)}",
+        "",
+        verdict(before, after),
+        "",
+        "Original:", original, "", "Rewrite:", rewrite,
+    ])
+
+
+# ---- Cards ------------------------------------------------------------------
+def text_el(value: str, style: str = "body") -> dict:
+    return {"type": "text", "value": value, "style": style}
+
+
+def heading_el(value: str, level: int = 3) -> dict:
+    return {"type": "heading", "value": value, "level": level}
+
+
+def button_el(label: str, action: str, session: str, primary: bool = False) -> dict:
+    return {"type": "button", "label": label, "primary": primary,
+            "action": {"selection": {"action": action, "session": session}}}
+
+
+def options(mapping: dict) -> list:
+    return [{"value": k, "label": v} for k, v in mapping.items()]
+
+
+def setup_card(session: str, has_content: bool) -> dict:
+    children = []
+    if not has_content:
+        children.append({"type": "input", "name": "content", "kind": "text", "required": True,
+                         "label": "Pitch, post or ad to test",
+                         "placeholder": "Paste the text your audience would see"})
+    children += [
+        {"type": "input", "name": "platform", "kind": "select", "label": "Platform",
+         "options": options(PLATFORMS)},
+        {"type": "input", "name": "region", "kind": "select", "label": "Target region",
+         "options": options(REGION_LABELS)},
+        {"type": "input", "name": "size", "kind": "select", "label": "Crowd size",
+         "options": [{"value": str(n), "label": f"{n:,} impressions"} for n in SIZES]},
+        button_el("Run test", "run", session, primary=True),
     ]
-    objection_items = [
-        {"children": [{"type": "text", "value": f"{i}. {o}"}]}
-        for i, o in enumerate(stats.get("objections", []), 1)
-    ]
+    return {"root": {
+        "type": "section", "title": "Test your content on a simulated crowd",
+        "subtitle": f"{len(CROWD_AGENTS) * 18} AI personas across {len(CROWD_AGENTS)} regions of India",
+        "children": children,
+    }}
+
+
+def results_card(s: dict, stats: dict, rewrite: str) -> dict:
     children = [
-        {
-            "type": "group",
-            "direction": "row",
-            "gap": 8,
-            "children": [
-                {"type": "badge", "label": f"❤️ {stats['love_pct']}% love", "variant": "success"},
-                {"type": "badge", "label": f"😐 {stats['ignore_pct']}% ignore", "variant": "info"},
-                {"type": "badge", "label": f"👎 {stats['hate_pct']}% hate", "variant": "warning"},
-            ],
-        },
-        {
-            "type": "text",
-            "value": f"{stats['shares']:,} shares → projected reach {stats['total_reach']:,}",
-            "style": "muted",
-        },
-        {"type": "divider"},
-        {"type": "heading", "value": "Segments", "level": 3},
-        {"type": "list", "items": seg_items},
+        {"type": "group", "direction": "row", "gap": 8, "children": [
+            {"type": "badge", "label": f"❤️ {stats['love_pct']}% love", "variant": "success"},
+            {"type": "badge", "label": f"😐 {stats['ignore_pct']}% ignore", "variant": "info"},
+            {"type": "badge", "label": f"👎 {stats['hate_pct']}% hate", "variant": "warning"},
+        ]},
+        text_el(f"{stats['shares']:,} shares → projected reach {stats['total_reach']:,}", "muted"),
     ]
-    if objection_items:
-        children += [
-            {"type": "heading", "value": "Top objections", "level": 3},
-            {"type": "list", "items": objection_items},
-        ]
+    target = next((r for r in s.get("regions", []) if r["region"] == s.get("region")), None)
+    if target:
+        children.append(text_el(f"Your target, {target['label']} ({target['n']} personas): {pct_line(target)}",
+                                "emphasis"))
     children += [
         {"type": "divider"},
-        {"type": "heading", "value": "Rewritten version", "level": 3},
-        {"type": "text", "value": rewrite[:1500]},
+        heading_el("By audience segment"),
+        {"type": "image", "src": segment_chart(stats), "alt": "Stacked bars of love, ignore and hate per audience segment"},
+        text_el(" · ".join(f"{x['label']}: {x['love_pct']}/{x['ignore_pct']}/{x['hate_pct']}"
+                           for x in stats["segments"]) + "  (love/ignore/hate %)", "muted"),
     ]
-    return {
-        "root": {
-            "type": "section",
-            "title": "Crowdcast results",
-            "subtitle": f"{stats['size']:,} simulated impressions from {stats['personas']} personas "
-            f"across {stats.get('crowd_agents', 1)} crowd agents",
-            "children": children,
-        }
-    }
+    if s.get("regions"):
+        children += [
+            heading_el("By region"),
+            {"type": "image", "src": region_chart(s["regions"]), "alt": "Stacked bars of love, ignore and hate per regional persona panel"},
+            text_el(" · ".join(f"{r['label']}: {r['love_pct']}/{r['ignore_pct']}/{r['hate_pct']}"
+                               for r in s["regions"]) + "  (raw panel %, love/ignore/hate)", "muted"),
+        ]
+    if stats.get("objections"):
+        children += [heading_el("Top objections"), {"type": "list", "items": [
+            {"children": [text_el(f"{i}. {o}")]} for i, o in enumerate(stats["objections"], 1)]}]
+    if stats.get("quotes"):
+        children += [heading_el("What the crowd said"), {"type": "list", "items": [
+            {"children": [text_el(f"“{q}”", "muted")]} for q in stats["quotes"]]}]
+    children += [{"type": "divider"}, heading_el("Rewritten version"), text_el(rewrite[:1500])]
+
+    buttons = []
+    if rewrite_ok(rewrite):
+        buttons.append(button_el("Test the rewrite", "retest", s["id"], primary=True))
+    buttons.append(button_el("Change setup", "setup", s["id"]))
+    if s.get("regions"):
+        buttons.append(button_el("Region details", "regions", s["id"]))
+    children += [
+        {"type": "group", "direction": "row", "gap": 8, "children": buttons},
+        text_el(f"Method: {stats['personas']} AI personas from {stats.get('crowd_agents', 1)} regional crowd "
+                f"agents reacted; segment numbers are weighted and expanded to {stats['size']:,} "
+                f"impressions, region numbers are the raw panels.", "muted"),
+    ]
+    return {"root": {
+        "type": "section", "title": "Crowdcast results",
+        "subtitle": f"{PLATFORMS.get(s.get('platform'), PLATFORMS['unspecified'])} · "
+                    f"{stats['size']:,} simulated impressions from {stats['personas']} personas",
+        "children": children,
+    }}
 
 
-def report_message(stats: dict, rewrite: str) -> ChatMessage:
-    content = [TextContent(type="text", text=build_report(stats, rewrite))]
-    if USE_CARDS:
-        content.append(
-            MetadataContent(
-                type="metadata",
-                metadata={
-                    "card_protocol_version": "1",
-                    "requires_card_interaction": "true",
-                    "is_terminal": "true",
-                    "card_kind": "custom",
-                    "card_payload": json.dumps(build_card(stats, rewrite)),
-                    "preferred_drawer_width_px": "600",
-                },
-            )
-        )
-    return ChatMessage(timestamp=now(), msg_id=uuid4(), content=content)
+def regions_card(s: dict) -> dict:
+    items = []
+    for r in s.get("regions", []):
+        rows = [text_el(f"{r['label']} — {r['n']} personas", "emphasis"), text_el(pct_line(r))]
+        if r["failed"]:
+            rows.append(text_el("This panel didn't answer properly; its personas count as 'ignore'.", "muted"))
+        rows += [text_el(f"“{q}”", "muted") for q in r["quotes"]]
+        rows += [text_el(f"Objection: {o}", "muted") for o in r["objections"]]
+        items.append({"children": rows})
+    return {"root": {
+        "type": "section", "title": "Regional persona panels",
+        "subtitle": "Raw reactions per regional crowd agent (not projected)",
+        "children": [{"type": "list", "items": items}],
+    }}
+
+
+def compare_card(before: dict, after: dict, original: str, rewrite: str) -> dict:
+    d_love = after["love_pct"] - before["love_pct"]
+    d_hate = after["hate_pct"] - before["hate_pct"]
+    return {"root": {
+        "type": "section", "title": "Original vs rewrite",
+        "subtitle": "Each version tested separately on the same crowd",
+        "children": [
+            {"type": "group", "direction": "row", "gap": 8, "children": [
+                {"type": "badge", "label": f"Love {d_love:+d} pts", "variant": "success" if d_love > 0 else "info"},
+                {"type": "badge", "label": f"Hate {d_hate:+d} pts", "variant": "warning" if d_hate > 0 else "info"},
+            ]},
+            {"type": "image", "src": compare_chart(before, after), "alt": "Stacked bars comparing original and rewrite"},
+            text_el(f"Original: {pct_line(before)}", "muted"),
+            text_el(f"Rewrite: {pct_line(after)}", "muted"),
+            text_el(verdict(before, after), "emphasis"),
+            {"type": "divider"},
+            heading_el("Original"), text_el(original[:1200]),
+            heading_el("Rewrite"), text_el(rewrite[:1200]),
+        ],
+    }}
+
+
+# ---- Card clicks ------------------------------------------------------------
+def parse_action(text: str):
+    """A card click: JSON selection (direct @mention) or prose that names the session id."""
+    body = strip_mentions(text).strip()
+    candidates = [body]
+    m = re.search(r"\{.*\}", body, re.S)
+    if m:
+        candidates.append(m.group(0))
+    for c in candidates:
+        try:
+            data = json.loads(c)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(data, dict) and data.get("action") in ACTIONS and data.get("session"):
+            return data
+    session = re.search(r"\b[0-9a-f]{32}\b", body)
+    if not session:
+        return None
+    low = body.lower()
+    action = next((a for a in ("retest", "regions", "setup", "run") if re.search(rf"\b{a}\b", low)), None)
+    if not action:
+        return None
+    data = {"action": action, "session": session.group(0)}
+    platform = next((k for k in PLATFORMS if k != "unspecified" and re.search(rf"\b{k}\b", low)), None)
+    region = next((k for k in REGION_LABELS if re.search(rf"\b{k}\b", low)), None)
+    size = re.search(r"\b(10|50|100)\s*(?:k|,?000)\b", low)
+    if platform:
+        data["platform"] = platform
+    if region:
+        data["region"] = region
+    if size:
+        data["size"] = str(int(size.group(1)) * 1000)
+    return data
+
+
+def new_session(ctx: Context, user: str, **fields) -> str:
+    session = uuid4().hex
+    ctx.storage.set(session, {"id": session, "user": user, **fields})
+    return session
+
+
+async def start_test(ctx: Context, user: str, content: str, platform: str, region: str,
+                     size: int, parent: str = None) -> str:
+    session = new_session(
+        ctx, user, content=content, platform=platform, region=region, size=size,
+        kind="retest" if parent else "test", parent=parent,
+        started=time.time(), pending=list(CROWD_ADDRESSES), batches=[], dispatched=False,
+    )
+    ctx.storage.set("active", (ctx.storage.get("active") or []) + [session])
+    ctx.logger.info(f"[{session}] new {'retest' if parent else 'test'} from {user}, "
+                    f"asking {len(CROWD_ADDRESSES)} crowd agents")
+    if SEND_PROGRESS:
+        what = "the rewrite" if parent else "your content"
+        await ctx.send(user, text_message(
+            f"🧪 Testing {what} on {len(CROWD_AGENTS) * 18} personas across "
+            f"{len(CROWD_AGENTS)} regional crowds… results in about a minute."))
+    for address in CROWD_ADDRESSES:
+        await ctx.send(address, CrowdRequest(session=session, content=for_crowd(content, platform)))
+    return session
+
+
+async def handle_action(ctx: Context, sender: str, action: dict):
+    s = ctx.storage.get(action["session"])
+    if not s or s.get("user") != sender:
+        await ctx.send(sender, text_message(
+            "That test isn't available any more. Paste your content again to start a new one."))
+        return
+    kind = action["action"]
+
+    if kind == "run":
+        content = (action.get("content") or s.get("content") or "").strip()
+        if len(content) < 15:
+            await ctx.send(sender, card_message(
+                "Please add the pitch, post or ad you want to test (at least a sentence).",
+                setup_card(s["id"], has_content=False), terminal=False))
+            return
+        platform = action.get("platform") if action.get("platform") in PLATFORMS else s.get("platform", "unspecified")
+        region = action.get("region") if action.get("region") in REGION_LABELS else s.get("region", "all")
+        try:
+            size = max(1_000, min(int(action.get("size") or s.get("size") or DEFAULT_SIZE), MAX_SIZE))
+        except (TypeError, ValueError):
+            size = DEFAULT_SIZE
+        await start_test(ctx, sender, clean_content(content), platform, region, size)
+
+    elif kind == "setup":
+        session = new_session(ctx, sender, content=s.get("content"), platform=s.get("platform", "unspecified"),
+                              region=s.get("region", "all"), size=s.get("size", DEFAULT_SIZE), kind="setup")
+        await ctx.send(sender, card_message(
+            "Pick a platform, target region and crowd size, then run the test again.",
+            setup_card(session, has_content=bool(s.get("content"))), terminal=False))
+
+    elif kind == "retest":
+        if not rewrite_ok(s.get("rewrite", "")):
+            await ctx.send(sender, text_message("There's no rewrite to test for that result yet."))
+            return
+        await start_test(ctx, sender, s["rewrite"], s.get("platform", "unspecified"),
+                         s.get("region", "all"), s.get("size", DEFAULT_SIZE), parent=s["id"])
+
+    elif kind == "regions":
+        if not s.get("regions"):
+            await ctx.send(sender, text_message("No regional breakdown is available for that result."))
+            return
+        text = "\n".join(f"{r['label']} ({r['n']} personas): {pct_line(r)}" for r in s["regions"])
+        await ctx.send(sender, card_message(text, regions_card(s), terminal=True))
 
 
 # ---- Chat protocol (ASI:One <-> orchestrator) ------------------------------
@@ -246,28 +590,20 @@ async def handle_chat(ctx: Context, sender: str, msg: ChatMessage):
     if not text:
         return  # e.g. StartSessionContent only
 
-    if len(text) < 15:
-        await ctx.send(
-            sender,
-            text_message(
-                "Hi, I'm Crowdcast 👋 Paste the startup pitch, Instagram post or ad you "
-                "want to test, and I'll drop it into a simulated crowd. "
-                "Add 'crowd 100k' to change the crowd size (default 10k)."
-            ),
-        )
+    action = parse_action(text)
+    if action:
+        await handle_action(ctx, sender, action)
         return
 
-    session = uuid4().hex
-    content = clean_content(text)
-    ctx.storage.set(session, {
-        "user": sender, "content": content, "size": parse_size(text),
-        "started": time.time(), "pending": list(CROWD_ADDRESSES), "reactions": [],
-        "dispatched": False,
-    })
-    ctx.storage.set("active", (ctx.storage.get("active") or []) + [session])
-    ctx.logger.info(f"[{session}] new test from {sender}, asking {len(CROWD_ADDRESSES)} crowd agents")
-    for address in CROWD_ADDRESSES:
-        await ctx.send(address, CrowdRequest(session=session, content=content))
+    if len(strip_mentions(text)) < 15:
+        session = new_session(ctx, sender, kind="setup", platform="unspecified", region="all", size=DEFAULT_SIZE)
+        await ctx.send(sender, card_message(
+            "Hi, I'm Crowdcast 👋 Paste the startup pitch, Instagram post or ad you want to test, "
+            "and I'll drop it into a simulated crowd. Add 'crowd 100k' to change the crowd size (default 10k).",
+            setup_card(session, has_content=False), terminal=False))
+        return
+
+    await start_test(ctx, sender, clean_content(text), "unspecified", "all", parse_size(text))
 
 
 @chat_proto.on_message(ChatAcknowledgement)
@@ -276,11 +612,15 @@ async def handle_ack(ctx: Context, sender: str, msg: ChatAcknowledgement):
 
 
 # ---- Pipeline: crowds (parallel) -> simulation -> rewrite -> user ----------
+REGION_OF = {address: region for region, address in CROWD_AGENTS.items()}
+
+
 async def send_to_simulation(ctx: Context, session: str, s: dict):
     s["dispatched"] = True
-    s["crowds"] = len(s["reactions"])
-    reactions = merge_reactions(s["reactions"], session)
-    s["reactions"] = []
+    s["crowds"] = len(s["batches"])
+    s["regions"] = summarise_regions(s["batches"])
+    reactions = merge_reactions([b["reactions"] for b in s["batches"]], session)
+    s["batches"] = []
     ctx.storage.set(session, s)
     await ctx.send(
         SIM_ADDRESS,
@@ -291,13 +631,13 @@ async def send_to_simulation(ctx: Context, session: str, s: dict):
 @agent.on_message(model=CrowdResult)
 async def on_crowd(ctx: Context, sender: str, msg: CrowdResult):
     s = ctx.storage.get(msg.session)
-    if not s or s.get("dispatched") or sender not in s["pending"]:
+    if not s or s.get("dispatched") or sender not in s.get("pending", []):
         return
     s["pending"].remove(sender)
-    s["reactions"].append(json.loads(msg.reactions_json))
+    s["batches"].append({"region": REGION_OF[sender], "reactions": json.loads(msg.reactions_json)})
     ctx.storage.set(msg.session, s)
     ctx.logger.info(
-        f"[{msg.session}] crowd {len(s['reactions'])}/{len(CROWD_ADDRESSES)} reacted"
+        f"[{msg.session}] crowd {len(s['batches'])}/{len(CROWD_ADDRESSES)} reacted"
     )
     if not s["pending"]:
         await send_to_simulation(ctx, msg.session, s)
@@ -317,10 +657,10 @@ async def check_timeouts(ctx: Context):
             keep.append(session)
     ctx.storage.set("active", keep)
     for session, s in due:
-        if s["reactions"]:
+        if s["batches"]:
             ctx.logger.warning(
                 f"[{session}] timed out waiting for {len(s['pending'])} crowd agent(s); "
-                f"going ahead with {len(s['reactions'])}"
+                f"going ahead with {len(s['batches'])}"
             )
             await send_to_simulation(ctx, session, s)
         else:
@@ -343,11 +683,23 @@ async def on_sim(ctx: Context, sender: str, msg: SimResult):
     s["stats"] = json.dumps(stats)
     ctx.storage.set(msg.session, s)
     ctx.logger.info(f"[{msg.session}] simulation done")
+
+    if s.get("kind") == "retest":
+        parent = ctx.storage.get(s["parent"]) or {}
+        if "stats" not in parent:
+            return
+        before = json.loads(parent["stats"])
+        ctx.logger.info(f"[{msg.session}] sending before/after to user")
+        await ctx.send(s["user"], card_message(
+            build_compare_report(before, stats, parent["content"], s["content"]),
+            compare_card(before, stats, parent["content"], s["content"]), terminal=True))
+        return
+
     await ctx.send(
         REWRITE_ADDRESS,
         RewriteRequest(
             session=msg.session,
-            content=s["content"],
+            content=for_crowd(s["content"], s.get("platform", "unspecified")),
             objections_json=json.dumps(stats.get("objections", [])),
         ),
     )
@@ -359,8 +711,12 @@ async def on_rewrite(ctx: Context, sender: str, msg: RewriteResult):
     if not s or "stats" not in s:
         return
     stats = json.loads(s["stats"])
+    rewrite = strip_format_line(msg.rewrite)
+    s["rewrite"] = rewrite
+    ctx.storage.set(msg.session, s)
     ctx.logger.info(f"[{msg.session}] sending report to user")
-    await ctx.send(s["user"], report_message(stats, msg.rewrite))
+    await ctx.send(s["user"], card_message(
+        build_report(s, stats, rewrite), results_card(s, stats, rewrite), terminal=False))
 
 
 agent.include(chat_proto, publish_manifest=True)
