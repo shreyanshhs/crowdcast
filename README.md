@@ -48,7 +48,7 @@ Report + interactive card back to the user
 | crowdcast-rewrite | `agent1qtumj924vkyrkzw6smrlkrg5ss0tqeevv34l4ehuhg88uttnxa7aq3wwrdl` | [profile](https://agentverse.ai/agents/details/agent1qtumj924vkyrkzw6smrlkrg5ss0tqeevv34l4ehuhg88uttnxa7aq3wwrdl/profile) |
 
 ## Try it
-1. Open [ASI:One](https://asi1.ai/chat) and mention the orchestrator agent.
+1. Open [ASI:One](https://asi1.ai/chat) and mention the orchestrator agent, `@crowdcast`.
 2. Paste your content, e.g. *"How will people react to this Instagram post: …"*
 3. Optional: add `crowd 100k` to change the crowd size (default 10k).
 
