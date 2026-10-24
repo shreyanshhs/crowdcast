@@ -1,16 +1,22 @@
 """
 Crowdcast — CROWD agent (hosted on Agentverse).
 
-Holds the persona panel. Each persona is a distinct audience member
-(age, city, interests, mood). The ASI:One LLM role-plays every persona
-and returns a structured reaction. Personas are batched into a few LLM
-calls to stay fast and inside rate limits.
+One regional persona panel. The same code runs as 5 hosted agents
+(north / south / west / east / central India); the orchestrator asks all
+of them in parallel and merges the answers. Each persona is a distinct
+audience member (age, city, interests, mood), generated from a fixed
+seed so a region's panel is the same on every run. The ASI:One LLM
+role-plays every persona and returns a structured reaction. Personas are
+batched into a few LLM calls to stay fast and inside rate limits.
 
-Secret needed on Agentverse (Build tab -> Agent Secrets): ASI1_API_KEY
+Secrets needed on Agentverse (Build tab -> Agent Secrets):
+  ASI1_API_KEY  - your ASI:One API key
+  CROWD_REGION  - north | south | west | east | central
 """
 
 import json
 import os
+import random
 import re
 
 import requests
@@ -34,21 +40,75 @@ class CrowdResult(Model):
 
 agent = Agent()
 
-# segment ids must match SEGMENTS in the simulation agent
-PERSONAS = [
-    {"id": 1, "name": "Ananya", "age": 19, "city": "Bengaluru", "segment": "students", "interests": "coding, anime, hackathons", "mood": "curious but broke"},
-    {"id": 2, "name": "Rohan", "age": 21, "city": "Pune", "segment": "students", "interests": "cricket, gaming, memes", "mood": "short attention span"},
-    {"id": 3, "name": "Fatima", "age": 20, "city": "Hyderabad", "segment": "students", "interests": "design, Instagram reels, fashion", "mood": "trend-driven"},
-    {"id": 4, "name": "Karthik", "age": 27, "city": "Chennai", "segment": "young_professionals", "interests": "startups, finance, fitness", "mood": "busy and sceptical"},
-    {"id": 5, "name": "Priya", "age": 29, "city": "Mumbai", "segment": "young_professionals", "interests": "marketing, travel, cafes", "mood": "ad-fatigued"},
-    {"id": 6, "name": "Arjun", "age": 31, "city": "Gurugram", "segment": "young_professionals", "interests": "tech, productivity, crypto", "mood": "early adopter"},
-    {"id": 7, "name": "Meera", "age": 38, "city": "Kochi", "segment": "parents", "interests": "kids' education, health, budgeting", "mood": "careful with money"},
-    {"id": 8, "name": "Suresh", "age": 45, "city": "Lucknow", "segment": "parents", "interests": "news, family, cricket", "mood": "distrusts new apps"},
-    {"id": 9, "name": "Neha", "age": 34, "city": "Bengaluru", "segment": "founders", "interests": "SaaS, growth hacking, VC news", "mood": "looking for an edge"},
-    {"id": 10, "name": "Vikram", "age": 42, "city": "Delhi", "segment": "founders", "interests": "D2C brands, operations, hiring", "mood": "ROI-focused"},
-    {"id": 11, "name": "Lakshmi", "age": 63, "city": "Mysuru", "segment": "seniors", "interests": "devotional music, cooking, grandkids", "mood": "prefers simple language"},
-    {"id": 12, "name": "Imran", "age": 24, "city": "Kolkata", "segment": "creators", "interests": "YouTube, music production, brand deals", "mood": "wants authenticity"},
+REGIONS = {
+    "north": {
+        "cities": ["Delhi", "Gurugram", "Noida", "Lucknow", "Jaipur", "Chandigarh", "Dehradun"],
+        "names": ["Aarav", "Ishita", "Kabir", "Simran", "Rohit", "Neha", "Harpreet", "Ankit", "Pooja",
+                  "Vikram", "Meenal", "Sahil", "Tanya", "Yash", "Ritu", "Gurpreet", "Aditi", "Manish"],
+    },
+    "south": {
+        "cities": ["Bengaluru", "Chennai", "Hyderabad", "Kochi", "Mysuru", "Coimbatore", "Visakhapatnam"],
+        "names": ["Ananya", "Karthik", "Divya", "Arjun", "Lakshmi", "Rahul", "Sneha", "Vignesh", "Priya",
+                  "Suresh", "Meera", "Naveen", "Kavya", "Farhan", "Deepa", "Aditya", "Revathi", "Sai"],
+    },
+    "west": {
+        "cities": ["Mumbai", "Pune", "Ahmedabad", "Surat", "Goa", "Nashik", "Vadodara"],
+        "names": ["Riya", "Omkar", "Krisha", "Parth", "Mitali", "Jay", "Siddharth", "Hetal", "Rohan",
+                  "Tanvi", "Dhruv", "Shruti", "Nikhil", "Isha", "Mihir", "Fatima", "Kunal", "Zoya"],
+    },
+    "east": {
+        "cities": ["Kolkata", "Bhubaneswar", "Patna", "Guwahati", "Ranchi", "Siliguri", "Shillong"],
+        "names": ["Arpita", "Sourav", "Debolina", "Abhishek", "Priyanka", "Moumita", "Subham", "Ankita",
+                  "Bikash", "Rupam", "Pallavi", "Imran", "Tania", "Arindam", "Nikita", "Ritwik", "Barsha", "Sayan"],
+    },
+    "central": {
+        "cities": ["Bhopal", "Indore", "Nagpur", "Raipur", "Jabalpur", "Gwalior", "Kanpur"],
+        "names": ["Aman", "Shreya", "Harsh", "Nidhi", "Ravi", "Kritika", "Ayush", "Saurabh", "Muskan",
+                  "Deepak", "Anjali", "Vivek", "Sakshi", "Gaurav", "Komal", "Rajat", "Swati", "Tushar"],
+    },
+}
+
+# segment ids must match SEGMENTS in the simulation agent; counts roughly follow its weights
+SEGMENT_MIX = [
+    ("students", 5, (18, 22), ["coding", "cricket", "gaming", "memes", "Instagram reels", "anime", "fashion", "exam prep", "college fests"]),
+    ("young_professionals", 5, (24, 32), ["startups", "personal finance", "fitness", "travel", "cafes", "productivity", "crypto", "OTT shows", "side hustles"]),
+    ("parents", 3, (35, 50), ["kids' education", "health", "budgeting", "news", "family trips", "home cooking", "cricket"]),
+    ("founders", 2, (28, 48), ["SaaS", "growth hacking", "VC news", "D2C brands", "operations", "hiring", "unit economics"]),
+    ("creators", 2, (19, 30), ["YouTube", "music production", "brand deals", "photography", "short-form video", "streetwear"]),
+    ("seniors", 1, (60, 72), ["devotional music", "cooking", "grandkids", "morning walks", "TV news", "gardening"]),
 ]
+MOODS = [
+    "curious but broke", "short attention span", "trend-driven", "busy and sceptical", "ad-fatigued",
+    "early adopter", "careful with money", "distrusts new apps", "looking for an edge", "ROI-focused",
+    "prefers simple language", "wants authenticity", "easily excited", "privacy-conscious",
+    "value-for-money hunter", "loyal to brands they know",
+]
+
+
+def build_personas(region: str) -> list:
+    """Deterministic panel for one region: same seed -> same 18 people every run."""
+    rng = random.Random(f"crowdcast-{region}")
+    pool = REGIONS[region]
+    names = rng.sample(pool["names"], sum(n for _, n, _, _ in SEGMENT_MIX))
+    personas = []
+    for segment, count, (lo, hi), interests in SEGMENT_MIX:
+        for _ in range(count):
+            personas.append({
+                "id": len(personas) + 1,
+                "name": names[len(personas)],
+                "age": rng.randint(lo, hi),
+                "city": rng.choice(pool["cities"]),
+                "segment": segment,
+                "interests": ", ".join(rng.sample(interests, 3)),
+                "mood": rng.choice(MOODS),
+            })
+    return personas
+
+
+REGION = os.environ.get("CROWD_REGION", "").strip().lower()
+if REGION not in REGIONS:
+    REGION = "south"
+PERSONAS = build_personas(REGION)
 
 SYSTEM_PROMPT = (
     "You simulate members of an audience reacting to a piece of content. "
@@ -130,9 +190,16 @@ def react(content: str, personas: list, ctx: Context) -> list:
     ]
 
 
+@agent.on_event("startup")
+async def on_startup(ctx: Context):
+    if os.environ.get("CROWD_REGION", "").strip().lower() != REGION:
+        ctx.logger.warning(f"CROWD_REGION secret missing or unknown; falling back to '{REGION}'")
+    ctx.logger.info(f"region {REGION}: {len(PERSONAS)} personas")
+
+
 @agent.on_message(model=CrowdRequest)
 async def on_request(ctx: Context, sender: str, msg: CrowdRequest):
-    ctx.logger.info(f"[{msg.session}] {len(PERSONAS)} personas reacting")
+    ctx.logger.info(f"[{msg.session}] {REGION}: {len(PERSONAS)} personas reacting")
     reactions = []
     for i in range(0, len(PERSONAS), BATCH_SIZE):
         reactions += react(msg.content, PERSONAS[i : i + BATCH_SIZE], ctx)
