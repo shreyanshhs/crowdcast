@@ -57,6 +57,13 @@ NOISE_PTS = 5         # identical runs differ by ~4 points; smaller gaps are "no
 USE_CARDS = True      # set False if the card ever causes trouble
 SEND_PROGRESS = True  # short "testing..." message while the crowd reacts
 
+# loop guards: one sender may only have this many tests running / started per window
+MAX_RUNNING_PER_SENDER = 1
+MAX_TESTS_PER_WINDOW = 6
+RATE_WINDOW_S = 600
+NOTICE_COOLDOWN_S = 60
+LOG_PREVIEW = 150  # characters of each incoming message written to the agent log
+
 REGION_LABELS = {
     "all": "All India", "north": "North India", "south": "South India",
     "west": "West India", "east": "East India", "central": "Central India",
@@ -68,6 +75,22 @@ PLATFORMS = {
 SIZES = [10_000, 50_000, 100_000]
 ACTIONS = ("run", "setup", "retest", "regions")
 REWRITE_FAILED = "(Rewrite unavailable"
+
+# button wording, for clicks that arrive as prose without our session id
+LABEL_ACTIONS = [
+    ("retest", r"\btest(?:ing)? the rewrite\b|\bretest\b"),
+    ("regions", r"\bregion(?:al)? (?:details|breakdown|panels?)\b|\bregions\b"),
+    ("setup", r"\bchange (?:the )?setup\b|\bsetup\b"),
+    ("run", r"\brun (?:the )?test\b"),
+]
+# questions about the agent itself (incl. ASI:One's "Tell me what you were created to do")
+HELP_RE = re.compile(
+    r"\b(what (can|do|does|did|are|were) (you|crowdcast)|who are you|what were you (created|made|built)"
+    r"|(created|made|built) to do|tell me (about yourself|what you)|how (does|do) (this|you|it|crowdcast) work"
+    r"|what is crowdcast|^(?:help|start|hello|hey|hi)\W*$)", re.I)
+# our own replies coming back at us (e.g. relayed by a planner) must never become a new test
+ECHO_MARKERS = ("🧪 Testing", "📣 ", "🔬 Original vs rewrite", "🗺️ Regional panels", "ℹ️ ", "⏳ ",
+                "Charts, objections and a rewrite are in the card", "Crowdcast results —", "Hi, I'm Crowdcast")
 
 # chart colours (dark mode): diverging pair (love = blue, hate = red) around a
 # neutral gray, on a dark surface; segments also carry direct labels + gaps
@@ -477,8 +500,13 @@ def compare_card(before: dict, after: dict, original: str, rewrite: str) -> dict
 
 
 # ---- Card clicks ------------------------------------------------------------
-def parse_action(text: str):
-    """A card click: JSON selection (direct @mention) or prose that names the session id."""
+def label_action(low: str):
+    return next((a for a, pattern in LABEL_ACTIONS if re.search(pattern, low)), None)
+
+
+def parse_action(text: str, latest: dict = None):
+    """A card click: JSON selection (direct @mention), prose that names the session id,
+    or short prose that only names the button (then the sender's latest session is used)."""
     body = strip_mentions(text).strip()
     candidates = [body]
     m = re.search(r"\{.*\}", body, re.S)
@@ -491,14 +519,20 @@ def parse_action(text: str):
             continue
         if isinstance(data, dict) and data.get("action") in ACTIONS and data.get("session"):
             return data
-    session = re.search(r"\b[0-9a-f]{32}\b", body)
-    if not session:
-        return None
     low = body.lower()
-    action = next((a for a in ("retest", "regions", "setup", "run") if re.search(rf"\b{a}\b", low)), None)
+    session = re.search(r"\b[0-9a-f]{32}\b", body)
+    action = label_action(low)
+    if not action and session:
+        action = next((a for a in ("retest", "regions", "setup", "run") if re.search(rf"\b{a}\b", low)), None)
     if not action:
         return None
-    data = {"action": action, "session": session.group(0)}
+    if session:
+        data = {"action": action, "session": session.group(0)}
+    elif len(body) < 300:
+        latest = latest or {}
+        data = {"action": action, "session": latest.get("setup" if action == "run" else "result")}
+    else:
+        return None
     platform = next((k for k in PLATFORMS if k != "unspecified" and re.search(rf"\b{k}\b", low)), None)
     region = next((k for k in REGION_LABELS if re.search(rf"\b{k}\b", low)), None)
     size = re.search(r"\b(10|50|100)\s*(?:k|,?000)\b", low)
@@ -517,14 +551,52 @@ def new_session(ctx: Context, user: str, **fields) -> str:
     return session
 
 
+def remember_latest(ctx: Context, user: str, kind: str, session: str):
+    latest = ctx.storage.get(f"latest:{user}") or {}
+    latest[kind] = session
+    ctx.storage.set(f"latest:{user}", latest)
+
+
+async def notice(ctx: Context, user: str, text: str):
+    """Plain text, at most once per cooldown, so a blocked loop can't feed itself."""
+    key = f"notice:{user}"
+    if time.time() - (ctx.storage.get(key) or 0) < NOTICE_COOLDOWN_S:
+        return
+    ctx.storage.set(key, time.time())
+    await ctx.send(user, text_message(f"ℹ️ {text}"))
+
+
+def finish_running(ctx: Context, user: str, session: str):
+    running = ctx.storage.get(f"running:{user}") or {}
+    running.pop(session, None)
+    ctx.storage.set(f"running:{user}", running)
+
+
 async def start_test(ctx: Context, user: str, content: str, platform: str, region: str,
-                     size: int, parent: str = None) -> str:
+                     size: int, parent: str = None):
+    """Start a crowd run unless this sender already has one going or has hit the rate limit."""
+    t = time.time()
+    running = {s: started for s, started in (ctx.storage.get(f"running:{user}") or {}).items()
+               if t - started < CROWD_TIMEOUT_S + 120}
+    starts = [x for x in (ctx.storage.get(f"starts:{user}") or []) if t - x < RATE_WINDOW_S]
+    if len(running) >= MAX_RUNNING_PER_SENDER:
+        ctx.logger.warning(f"blocked new test from {user}: {len(running)} already running")
+        await notice(ctx, user, "A test is already running. I'll post the results here as soon as they're ready.")
+        return None
+    if len(starts) >= MAX_TESTS_PER_WINDOW:
+        ctx.logger.warning(f"blocked new test from {user}: rate limit ({len(starts)} in {RATE_WINDOW_S}s)")
+        await notice(ctx, user, "You've run a lot of tests in the last few minutes. Please wait a bit and try again.")
+        return None
+
     session = new_session(
         ctx, user, content=content, platform=platform, region=region, size=size,
         kind="retest" if parent else "test", parent=parent,
         started=time.time(), pending=list(CROWD_ADDRESSES), batches=[], dispatched=False,
     )
     ctx.storage.set("active", (ctx.storage.get("active") or []) + [session])
+    running[session] = t
+    ctx.storage.set(f"running:{user}", running)
+    ctx.storage.set(f"starts:{user}", starts + [t])
     ctx.logger.info(f"[{session}] new {'retest' if parent else 'test'} from {user}, "
                     f"asking {len(CROWD_ADDRESSES)} crowd agents")
     if SEND_PROGRESS:
@@ -538,18 +610,20 @@ async def start_test(ctx: Context, user: str, content: str, platform: str, regio
 
 
 async def handle_action(ctx: Context, sender: str, action: dict):
-    s = ctx.storage.get(action["session"])
+    s = ctx.storage.get(action["session"]) if action.get("session") else None
     if not s or s.get("user") != sender:
-        await ctx.send(sender, text_message(
-            "That test isn't available any more. Paste your content again to start a new one."))
+        ctx.logger.warning(f"click '{action['action']}' for unknown session {action.get('session')}")
+        await notice(ctx, sender, "That test isn't available any more. Paste your content again to start a new one.")
         return
     kind = action["action"]
+    ctx.logger.info(f"[{s['id']}] click: {kind}")
 
     if kind == "run":
         content = (action.get("content") or s.get("content") or "").strip()
         if len(content) < 15:
+            remember_latest(ctx, sender, "setup", s["id"])
             await ctx.send(sender, card_message(
-                "Please add the pitch, post or ad you want to test (at least a sentence).",
+                "ℹ️ Please add the pitch, post or ad you want to test (at least a sentence).",
                 setup_card(s["id"], has_content=False), terminal=False))
             return
         platform = action.get("platform") if action.get("platform") in PLATFORMS else s.get("platform", "unspecified")
@@ -563,22 +637,30 @@ async def handle_action(ctx: Context, sender: str, action: dict):
     elif kind == "setup":
         session = new_session(ctx, sender, content=s.get("content"), platform=s.get("platform", "unspecified"),
                               region=s.get("region", "all"), size=s.get("size", DEFAULT_SIZE), kind="setup")
+        remember_latest(ctx, sender, "setup", session)
         await ctx.send(sender, card_message(
-            "Pick a platform, target region and crowd size, then run the test again.",
+            "ℹ️ Pick a platform, target region and crowd size, then run the test again.",
             setup_card(session, has_content=bool(s.get("content"))), terminal=False))
 
     elif kind == "retest":
         if not rewrite_ok(s.get("rewrite", "")):
-            await ctx.send(sender, text_message("There's no rewrite to test for that result yet."))
+            await notice(ctx, sender, "There's no rewrite to test for that result yet.")
             return
-        await start_test(ctx, sender, s["rewrite"], s.get("platform", "unspecified"),
-                         s.get("region", "all"), s.get("size", DEFAULT_SIZE), parent=s["id"])
+        if s.get("retest"):  # one retest per result: repeated (or auto-)clicks must not start more runs
+            ctx.logger.warning(f"[{s['id']}] ignored repeat retest click")
+            await notice(ctx, sender, "That rewrite has already been tested; the before/after card is above.")
+            return
+        child = await start_test(ctx, sender, s["rewrite"], s.get("platform", "unspecified"),
+                                 s.get("region", "all"), s.get("size", DEFAULT_SIZE), parent=s["id"])
+        if child:
+            s["retest"] = child
+            ctx.storage.set(s["id"], s)
 
     elif kind == "regions":
         if not s.get("regions"):
             await ctx.send(sender, text_message("No regional breakdown is available for that result."))
             return
-        text = "\n".join(f"{r['label']} ({r['n']} personas): {pct_line(r)}" for r in s["regions"])
+        text = "🗺️ Regional panels:\n" + "\n".join(f"{r['label']} ({r['n']} personas): {pct_line(r)}" for r in s["regions"])
         await ctx.send(sender, card_message(text, regions_card(s), terminal=True))
 
 
@@ -590,14 +672,21 @@ async def handle_chat(ctx: Context, sender: str, msg: ChatMessage):
     text = " ".join(c.text for c in msg.content if isinstance(c, TextContent)).strip()
     if not text:
         return  # e.g. StartSessionContent only
+    ctx.logger.info(f"message from {sender}: {text[:LOG_PREVIEW]!r}")
 
-    action = parse_action(text)
+    if any(marker in text for marker in ECHO_MARKERS):
+        ctx.logger.warning("ignored: looks like one of our own replies")
+        return
+
+    action = parse_action(text, ctx.storage.get(f"latest:{sender}"))
     if action:
         await handle_action(ctx, sender, action)
         return
 
-    if len(strip_mentions(text)) < 15:
+    body = strip_mentions(text)
+    if len(body) < 15 or HELP_RE.search(body):
         session = new_session(ctx, sender, kind="setup", platform="unspecified", region="all", size=DEFAULT_SIZE)
+        remember_latest(ctx, sender, "setup", session)
         await ctx.send(sender, card_message(
             "Hi, I'm Crowdcast 👋 Paste the startup pitch, Instagram post or ad you want to test, "
             "and I'll drop it into a simulated crowd. Add 'crowd 100k' to change the crowd size (default 10k).",
@@ -667,10 +756,11 @@ async def check_timeouts(ctx: Context):
         else:
             s["dispatched"] = True
             ctx.storage.set(session, s)
+            finish_running(ctx, s["user"], session)
             ctx.logger.warning(f"[{session}] no crowd agent answered")
             await ctx.send(
                 s["user"],
-                text_message("Sorry, the crowd didn't respond in time. Please try again in a minute."),
+                text_message("ℹ️ Sorry, the crowd didn't respond in time. Please try again in a minute."),
             )
 
 
@@ -686,14 +776,16 @@ async def on_sim(ctx: Context, sender: str, msg: SimResult):
     ctx.logger.info(f"[{msg.session}] simulation done")
 
     if s.get("kind") == "retest":
+        finish_running(ctx, s["user"], msg.session)
         parent = ctx.storage.get(s["parent"]) or {}
         if "stats" not in parent:
             return
         before = json.loads(parent["stats"])
         ctx.logger.info(f"[{msg.session}] sending before/after to user")
+        text = (f"🔬 Original vs rewrite: {verdict(before, stats)}" if USE_CARDS
+                else build_compare_report(before, stats, parent["content"], s["content"]))
         await ctx.send(s["user"], card_message(
-            build_compare_report(before, stats, parent["content"], s["content"]),
-            compare_card(before, stats, parent["content"], s["content"]), terminal=True))
+            text, compare_card(before, stats, parent["content"], s["content"]), terminal=True))
         return
 
     await ctx.send(
@@ -715,9 +807,14 @@ async def on_rewrite(ctx: Context, sender: str, msg: RewriteResult):
     rewrite = strip_format_line(msg.rewrite)
     s["rewrite"] = rewrite
     ctx.storage.set(msg.session, s)
+    finish_running(ctx, s["user"], msg.session)
+    remember_latest(ctx, s["user"], "result", msg.session)
     ctx.logger.info(f"[{msg.session}] sending report to user")
-    await ctx.send(s["user"], card_message(
-        build_report(s, stats, rewrite), results_card(s, stats, rewrite), terminal=False))
+    text = (f"📣 {stats['size']:,} simulated impressions: ❤️ {stats['love_pct']}% love · "
+            f"😐 {stats['ignore_pct']}% ignore · 👎 {stats['hate_pct']}% hate. "
+            f"Charts, objections and a rewrite are in the card below." if USE_CARDS
+            else build_report(s, stats, rewrite))
+    await ctx.send(s["user"], card_message(text, results_card(s, stats, rewrite), terminal=False))
 
 
 agent.include(chat_proto, publish_manifest=True)
