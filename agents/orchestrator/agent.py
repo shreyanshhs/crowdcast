@@ -492,10 +492,12 @@ def post_preview(platform: str, content: str, stats: dict, region: str, label: s
     rows = []
     if label:
         rows.append(heading_el(label))
+    hook = hook_of(content)
+    rest = body[len(hook):].strip() if body.startswith(hook) else body
+    rows += [text_el(f"{SOCIAL_PLATFORMS[platform]} · @yourbrand", "muted"), text_el(hook, "emphasis")]
+    if rest:   # one-sentence posts are all hook; don't print them twice
+        rows.append(text_el(rest))
     rows += [
-        text_el(f"{SOCIAL_PLATFORMS[platform]} · @yourbrand", "muted"),
-        text_el(hook_of(content), "emphasis"),
-        text_el(body),
         text_el(" ".join(hashtags(content, region)), "muted"),
         {"type": "group", "direction": "row", "gap": 8, "children": [
             {"type": "badge", "label": f"❤️ {stats['love_pct']}% love", "variant": "success"},
