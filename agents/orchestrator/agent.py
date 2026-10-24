@@ -29,6 +29,8 @@ from datetime import datetime, timezone
 from urllib.parse import urlencode
 from uuid import uuid4
 
+import os
+
 from uagents import Agent, Context, Model, Protocol
 from uagents_core.contrib.protocols.chat import (
     ChatAcknowledgement,
@@ -36,6 +38,15 @@ from uagents_core.contrib.protocols.chat import (
     MetadataContent,
     TextContent,
     chat_protocol_spec,
+)
+from uagents_core.contrib.protocols.payment import (
+    CancelPayment,
+    CommitPayment,
+    CompletePayment,
+    Funds,
+    RejectPayment,
+    RequestPayment,
+    payment_protocol_spec,
 )
 
 # ---- Addresses of the other hosted agents ----------------------------------
@@ -73,7 +84,24 @@ PLATFORMS = {
     "linkedin": "LinkedIn post", "x": "X (Twitter) post", "youtube": "YouTube video", "ad": "Ad",
 }
 SIZES = [10_000, 50_000, 100_000]
-ACTIONS = ("run", "setup", "retest", "regions")
+ACTIONS = ("run", "setup", "retest", "regions", "social", "variants", "unlock")
+
+# ---- Paid full report (Agent Payment Protocol, FET on testnet) -------------
+# The receiving wallet is an Agentverse secret; without it everything stays free.
+FET_WALLET_ENV = "CROWDCAST_FET_WALLET"   # fetch1... address that receives payments (no private key)
+PRICE_ENV = "CROWDCAST_PRICE_FET"         # e.g. "0.5"
+DEFAULT_PRICE_FET = "0.5"
+FET_DENOM = "atestfet"                    # stable-testnet; "afet" would be real FET on mainnet
+PAYMENT_DEADLINE_S = 600
+
+SOCIAL_PLATFORMS = {"instagram": "Instagram", "linkedin": "LinkedIn", "x": "X"}
+SOCIAL_FORMATS = {
+    "instagram": "Carousel or 15–30s reel; put the hook in the first slide or first 2 seconds.",
+    "linkedin": "Text post with one image; hook in the first line, short paragraphs.",
+    "x": "Single post under 280 characters; lead with the hook, one link at most.",
+}
+STOPWORDS = set("""a an and are as at be by for from get has have in into is it its of on or our so that the
+their this to was we with you your every new just more most only than then them they very will""".split())
 REWRITE_FAILED = "(Rewrite unavailable"
 
 # button wording, for clicks that arrive as prose without our session id
@@ -82,6 +110,9 @@ LABEL_ACTIONS = [
     ("regions", r"\bregion(?:al)? (?:details|breakdown|panels?)\b|\bregions\b"),
     ("setup", r"\bchange (?:the )?setup\b|\bsetup\b"),
     ("run", r"\brun (?:the )?test\b"),
+    ("unlock", r"\bunlock\b"),
+    ("variants", r"\bpreview both\b|\bvariants?\b"),
+    ("social", r"\bsocial preview\b|\bpost preview\b"),
 ]
 # questions about the agent itself (incl. ASI:One's "Tell me what you were created to do")
 HELP_RE = re.compile(
@@ -140,6 +171,7 @@ class RewriteResult(Model):
 
 agent = Agent()
 chat_proto = Protocol(spec=chat_protocol_spec)
+payment_proto = Protocol(spec=payment_protocol_spec, role="seller")
 
 
 # ---- Helpers ---------------------------------------------------------------
@@ -381,9 +413,124 @@ def heading_el(value: str, level: int = 3) -> dict:
     return {"type": "heading", "value": value, "level": level}
 
 
-def button_el(label: str, action: str, session: str, primary: bool = False) -> dict:
+def button_el(label: str, action: str, session: str, primary: bool = False, **extra) -> dict:
     return {"type": "button", "label": label, "primary": primary,
-            "action": {"selection": {"action": action, "session": session}}}
+            "action": {"selection": {"action": action, "session": session, **extra}}}
+
+
+# ---- Payments: helpers ------------------------------------------------------
+def fet_wallet() -> str:
+    return os.environ.get(FET_WALLET_ENV, "").strip()
+
+
+def payments_enabled() -> bool:
+    return fet_wallet().startswith("fetch1")
+
+
+def price_fet() -> str:
+    price = os.environ.get(PRICE_ENV, "").strip() or DEFAULT_PRICE_FET
+    try:
+        return price if float(price) > 0 else DEFAULT_PRICE_FET
+    except ValueError:
+        return DEFAULT_PRICE_FET
+
+
+def is_unlocked(s: dict) -> bool:
+    return not payments_enabled() or bool(s.get("paid"))
+
+
+def verify_fet_payment(tx_hash: str, recipient: str, amount_fet: str, sender_wallet: str = "") -> bool:
+    """Check on the Fetch.ai stable-testnet ledger that tx_hash moved >= amount to our wallet."""
+    from cosmpy.aerial.client import LedgerClient, NetworkConfig  # imported lazily: only paid flows need it
+
+    tx = LedgerClient(NetworkConfig.fetchai_stable_testnet()).query_tx(tx_hash)
+    if not tx.is_successful():
+        return False
+    need = int(round(float(amount_fet) * 10**18))
+    transfers = []
+    for events in [tx.events] + [getattr(log, "events", {}) for log in (getattr(tx, "logs", None) or [])]:
+        found = (events or {}).get("transfer") if isinstance(events, dict) else None
+        transfers += found if isinstance(found, list) else [found] if isinstance(found, dict) else []
+    for event in transfers:
+        amount = str(event.get("amount", ""))
+        if (event.get("recipient") == recipient and amount.endswith(FET_DENOM)
+                and (not sender_wallet or event.get("sender") == sender_wallet)
+                and int(amount[: -len(FET_DENOM)] or 0) >= need):
+            return True
+    return False
+
+
+# ---- Social previews --------------------------------------------------------
+def hashtags(content: str, region: str) -> list:
+    """Simple keyword hashtags from the user's own words (suggestions, not trend data)."""
+    words = re.findall(r"[A-Za-z][A-Za-z']{4,}", content)
+    counts = {}
+    for w in words:
+        if w.lower() not in STOPWORDS:
+            counts[w.lower()] = counts.get(w.lower(), 0) + 1
+    tags = [f"#{w}" for w, _ in sorted(counts.items(), key=lambda kv: (-kv[1], -len(kv[0])))[:4]]
+    if region in CROWD_AGENTS:
+        tags.append(f"#{REGION_LABELS[region].replace(' ', '')}")
+    return tags
+
+
+def hook_of(content: str) -> str:
+    first = re.split(r"(?<=[.!?])\s+|\n", content.strip(), maxsplit=1)[0]
+    return first[:120]
+
+
+def social_platform(s: dict, requested: str = None) -> str:
+    if requested in SOCIAL_PLATFORMS:
+        return requested
+    return s.get("platform") if s.get("platform") in SOCIAL_PLATFORMS else "instagram"
+
+
+def post_preview(platform: str, content: str, stats: dict, region: str, label: str = None) -> list:
+    """Children for one platform-styled mock post (stays within the 8-level nesting limit)."""
+    limit = 280 if platform == "x" else 2200
+    body = content if len(content) <= limit else content[: limit - 1] + "…"
+    rows = []
+    if label:
+        rows.append(heading_el(label))
+    rows += [
+        text_el(f"{SOCIAL_PLATFORMS[platform]} · @yourbrand", "muted"),
+        text_el(hook_of(content), "emphasis"),
+        text_el(body),
+        text_el(" ".join(hashtags(content, region)), "muted"),
+        {"type": "group", "direction": "row", "gap": 8, "children": [
+            {"type": "badge", "label": f"❤️ {stats['love_pct']}% love", "variant": "success"},
+            {"type": "badge", "label": f"👎 {stats['hate_pct']}% hate", "variant": "warning"},
+        ]},
+    ]
+    if platform == "x" and len(content) > 280:
+        rows.append(text_el(f"Too long for one X post ({len(content)} characters, limit 280).", "muted"))
+    return rows
+
+
+def social_card(s: dict, stats: dict, platform: str) -> dict:
+    children = post_preview(platform, s["content"], stats, s.get("region"))
+    children += [
+        {"type": "divider"},
+        text_el(f"Suggested format: {SOCIAL_FORMATS[platform]}", "muted"),
+        text_el("Hashtags are keywords from your own text, not trend data. Nothing is posted anywhere.", "muted"),
+        {"type": "group", "direction": "row", "gap": 8, "children": [
+            button_el(name, "social", s["id"], primary=(key == platform), platform=key)
+            for key, name in SOCIAL_PLATFORMS.items()
+        ]},
+    ]
+    return {"root": {"type": "section", "title": f"{SOCIAL_PLATFORMS[platform]} preview",
+                     "subtitle": "Your content as a post, with its crowd score", "children": children}}
+
+
+def variants_card(parent: dict, before: dict, child: dict, after: dict, platform: str) -> dict:
+    winner = verdict(before, after)
+    children = [text_el(winner, "emphasis"), {"type": "divider"}]
+    children += post_preview(platform, parent["content"], before, parent.get("region"), "Original")
+    children += [{"type": "divider"}]
+    children += post_preview(platform, child["content"], after, parent.get("region"), "Rewrite")
+    children += [text_el("Nothing is posted anywhere; copy the version you prefer.", "muted")]
+    return {"root": {"type": "section", "title": f"Original vs rewrite as {SOCIAL_PLATFORMS[platform]} posts",
+                     "subtitle": "Each version tested separately on the same crowd", "children": children}}
 
 
 def options(mapping: dict) -> list:
@@ -432,26 +579,36 @@ def results_card(s: dict, stats: dict, rewrite: str) -> dict:
         text_el(" · ".join(f"{x['label']}: {x['love_pct']}/{x['ignore_pct']}/{x['hate_pct']}"
                            for x in stats["segments"]) + "  (love/ignore/hate %)", "muted"),
     ]
-    if s.get("regions"):
+    full = is_unlocked(s)
+    if s.get("regions") and full:
         children += [
             heading_el("By region"),
             {"type": "image", "src": region_chart(s["regions"]), "alt": "Stacked bars of love, ignore and hate per regional persona panel"},
             text_el(" · ".join(f"{r['label']}: {r['love_pct']}/{r['ignore_pct']}/{r['hate_pct']}"
                                for r in s["regions"]) + "  (raw panel %, love/ignore/hate)", "muted"),
         ]
-    if stats.get("objections"):
+    objections = stats.get("objections", []) if full else stats.get("objections", [])[:2]
+    if objections:
         children += [heading_el("Top objections"), {"type": "list", "items": [
-            {"children": [text_el(f"{i}. {o}")]} for i, o in enumerate(stats["objections"], 1)]}]
-    if stats.get("quotes"):
+            {"children": [text_el(f"{i}. {o}")]} for i, o in enumerate(objections, 1)]}]
+    if stats.get("quotes") and full:
         children += [heading_el("What the crowd said"), {"type": "list", "items": [
             {"children": [text_el(f"“{q}”", "muted")]} for q in stats["quotes"]]}]
-    children += [{"type": "divider"}, heading_el("Rewritten version"), text_el(rewrite[:1500])]
+    if full:
+        children += [{"type": "divider"}, heading_el("Rewritten version"), text_el(rewrite[:1500])]
+    else:
+        children += [{"type": "divider"}, text_el(
+            f"🔒 Full report: region chart and details, every objection, persona quotes, the rewrite and a "
+            f"before/after retest. {price_fet()} testFET, paid from your ASI:One wallet.", "emphasis")]
 
     buttons = []
-    if rewrite_ok(rewrite):
+    if not full:
+        buttons.append(button_el(f"Unlock full report ({price_fet()} testFET)", "unlock", s["id"], primary=True))
+    elif rewrite_ok(rewrite):
         buttons.append(button_el("Test the rewrite", "retest", s["id"], primary=True))
+    buttons.append(button_el("Social preview", "social", s["id"]))
     buttons.append(button_el("Change setup", "setup", s["id"]))
-    if s.get("regions"):
+    if s.get("regions") and full:
         buttons.append(button_el("Region details", "regions", s["id"]))
     children += [
         {"type": "group", "direction": "row", "gap": 8, "children": buttons},
@@ -483,7 +640,7 @@ def regions_card(s: dict) -> dict:
     }}
 
 
-def compare_card(before: dict, after: dict, original: str, rewrite: str) -> dict:
+def compare_card(before: dict, after: dict, original: str, rewrite: str, session: str = None) -> dict:
     d_love = after["love_pct"] - before["love_pct"]
     d_hate = after["hate_pct"] - before["hate_pct"]
     return {"root": {
@@ -501,6 +658,7 @@ def compare_card(before: dict, after: dict, original: str, rewrite: str) -> dict
             {"type": "divider"},
             heading_el("Original"), text_el(original[:1200]),
             heading_el("Rewrite"), text_el(rewrite[:1200]),
+        ] + ([button_el("Preview both as posts", "variants", session, primary=True)] if session else []) + [
         ],
     }}
 
@@ -615,6 +773,65 @@ async def start_test(ctx: Context, user: str, content: str, platform: str, regio
     return session
 
 
+async def request_payment(ctx: Context, user: str, s: dict):
+    """Seller side of the Agent Payment Protocol: ask the user's wallet for the full-report price."""
+    if not payments_enabled():
+        await notice(ctx, user, "Payments aren't set up yet, so the full report is already included.")
+        return
+    if s.get("paid"):
+        await notice(ctx, user, "This report is already unlocked.")
+        return
+    if time.time() - s.get("payment_requested", 0) < 60:   # don't stack payment prompts on repeat clicks
+        return
+    s["payment_requested"] = time.time()
+    ctx.storage.set(s["id"], s)
+    ctx.logger.info(f"[{s['id']}] requesting {price_fet()} testFET")
+    await ctx.send(user, RequestPayment(
+        accepted_funds=[Funds(amount=price_fet(), currency="FET", payment_method="fet_direct")],
+        recipient=fet_wallet(),
+        deadline_seconds=PAYMENT_DEADLINE_S,
+        reference=s["id"],
+        description=f"Crowdcast full report ({price_fet()} testFET, Fetch.ai testnet)",
+        metadata={"fet_network": "stable-testnet", "service": "crowdcast_full_report"},
+    ))
+
+
+@payment_proto.on_message(CommitPayment)
+async def on_commit(ctx: Context, sender: str, msg: CommitPayment):
+    s = ctx.storage.get(msg.reference or "") or {}
+    used = ctx.storage.get("used_tx") or []
+    ok = False
+    if (s.get("user") == sender and not s.get("paid") and msg.transaction_id not in used
+            and msg.funds.currency == "FET" and msg.funds.payment_method == "fet_direct"
+            and float(msg.funds.amount or 0) >= float(price_fet())):
+        buyer = ""
+        if isinstance(msg.metadata, dict):
+            buyer = str(msg.metadata.get("buyer_fet_wallet") or msg.metadata.get("buyer_fet_address") or "")
+        try:
+            ok = verify_fet_payment(msg.transaction_id, fet_wallet(), price_fet(), buyer)
+        except Exception as e:  # noqa: BLE001
+            ctx.logger.warning(f"[{s.get('id')}] payment check failed: {e}")
+    if not ok:
+        ctx.logger.warning(f"payment not accepted for {msg.reference}: tx {msg.transaction_id}")
+        await ctx.send(sender, CancelPayment(transaction_id=msg.transaction_id,
+                                             reason="Payment could not be verified on the Fetch.ai testnet"))
+        return
+    ctx.storage.set("used_tx", (used + [msg.transaction_id])[-500:])
+    s["paid"] = msg.transaction_id
+    ctx.storage.set(s["id"], s)
+    ctx.logger.info(f"[{s['id']}] payment verified: {msg.transaction_id}")
+    await ctx.send(sender, CompletePayment(transaction_id=msg.transaction_id))
+    stats = json.loads(s["stats"])
+    await ctx.send(sender, card_message(
+        "ℹ️ Payment received. Here's your full report.", results_card(s, stats, s.get("rewrite", "")),
+        terminal=False))
+
+
+@payment_proto.on_message(RejectPayment)
+async def on_reject(ctx: Context, sender: str, msg: RejectPayment):
+    ctx.logger.info(f"payment rejected by {sender}: {msg.reason}")
+
+
 async def handle_action(ctx: Context, sender: str, action: dict):
     s = ctx.storage.get(action["session"]) if action.get("session") else None
     if not s or s.get("user") != sender:
@@ -623,6 +840,34 @@ async def handle_action(ctx: Context, sender: str, action: dict):
         return
     kind = action["action"]
     ctx.logger.info(f"[{s['id']}] click: {kind}")
+    if kind in ("retest", "regions") and not is_unlocked(s):
+        kind = "unlock"   # paid features: ask for payment instead
+
+    if kind == "unlock":
+        await request_payment(ctx, sender, s)
+        return
+
+    if kind == "social":
+        if "stats" not in s:
+            await notice(ctx, sender, "Run a test first; the preview shows your post with its crowd score.")
+            return
+        platform = social_platform(s, action.get("platform"))
+        await ctx.send(sender, card_message(
+            f"ℹ️ {SOCIAL_PLATFORMS[platform]} preview of your post.",
+            social_card(s, json.loads(s["stats"]), platform), terminal=False))
+        return
+
+    if kind == "variants":
+        parent = ctx.storage.get(s.get("parent") or "") or {}
+        if s.get("kind") != "retest" or "stats" not in s or "stats" not in parent:
+            await notice(ctx, sender, "Test the rewrite first, then preview both versions as posts.")
+            return
+        platform = social_platform(parent, action.get("platform"))
+        await ctx.send(sender, card_message(
+            f"ℹ️ Original and rewrite as {SOCIAL_PLATFORMS[platform]} posts.",
+            variants_card(parent, json.loads(parent["stats"]), s, json.loads(s["stats"]), platform),
+            terminal=True))
+        return
 
     if kind == "run":
         content = (action.get("content") or s.get("content") or "").strip()
@@ -794,7 +1039,7 @@ async def on_sim(ctx: Context, sender: str, msg: SimResult):
         text = (f"🔬 Original vs rewrite: {verdict(before, stats)}" if USE_CARDS
                 else build_compare_report(before, stats, parent["content"], s["content"]))
         await ctx.send(s["user"], card_message(
-            text, compare_card(before, stats, parent["content"], s["content"]), terminal=True))
+            text, compare_card(before, stats, parent["content"], s["content"], msg.session), terminal=False))
         return
 
     await ctx.send(
@@ -827,6 +1072,7 @@ async def on_rewrite(ctx: Context, sender: str, msg: RewriteResult):
 
 
 agent.include(chat_proto, publish_manifest=True)
+agent.include(payment_proto, publish_manifest=True)
 
 if __name__ == "__main__":
     agent.run()
